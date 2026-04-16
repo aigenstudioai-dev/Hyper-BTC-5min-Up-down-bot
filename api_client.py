@@ -287,7 +287,9 @@ class PolymarketClient:
 
         markets: List[MarketInfo] = []
 
-        # Gamma API returns markets with question text and metadata
+        # Gamma API – fetch a broad active slice and filter client-side.
+        # We intentionally avoid narrow server-side filters (like tag_slug) that
+        # vary across API versions; the _is_btc_5min_market() heuristic handles it.
         try:
             data = self._get(
                 GAMMA_BASE_URL,
@@ -295,8 +297,7 @@ class PolymarketClient:
                 params={
                     "active": "true",
                     "closed": "false",
-                    "tag_slug": "crypto",
-                    "limit": 200,
+                    "limit": 500,
                 },
             )
         except Exception as exc:
@@ -304,17 +305,33 @@ class PolymarketClient:
             return markets
 
         raw_markets = data if isinstance(data, list) else data.get("markets", [])
+        logger.debug("Gamma API returned %d raw markets to filter", len(raw_markets))
 
         for m in raw_markets:
+            cid = m.get("conditionId") or m.get("condition_id", "")
+            if not cid:
+                logger.debug("Skipping market with no conditionId: %s", m.get("question", "")[:60])
+                continue
+
             if not _is_btc_5min_market(m):
                 continue
 
             end_ts = _parse_end_time(m)
-            if end_ts is None or end_ts not in target_windows:
+            if end_ts is None:
+                logger.debug("Skipping – could not parse end time: %s", m.get("question", "")[:60])
+                continue
+            if end_ts not in target_windows:
+                logger.debug(
+                    "Skipping – end_ts %d not in target windows %s: %s",
+                    end_ts, target_windows, m.get("question", "")[:60],
+                )
                 continue
 
             tokens = _extract_tokens(m)
             if tokens is None:
+                logger.warning(
+                    "Skipping – could not extract token IDs for: %s", m.get("question", "")[:60]
+                )
                 continue
 
             book = self._fetch_orderbook(tokens.yes_token_id)
@@ -322,7 +339,7 @@ class PolymarketClient:
 
             markets.append(
                 MarketInfo(
-                    condition_id=m.get("conditionId", m.get("condition_id", "")),
+                    condition_id=cid,
                     question=m.get("question", ""),
                     end_time=end_ts,
                     tokens=tokens,
@@ -335,7 +352,7 @@ class PolymarketClient:
             )
 
         markets.sort(key=lambda m: m.end_time)
-        logger.debug("Found %d BTC 5-min markets", len(markets))
+        logger.info("Found %d valid BTC 5-min markets (from %d raw)", len(markets), len(raw_markets))
         return markets
 
     def _fetch_orderbook(self, token_id: str) -> Dict[str, float]:
@@ -559,16 +576,40 @@ def _next_window_close(now: int, offset: int = 0) -> int:
 def _is_btc_5min_market(market: dict) -> bool:
     """
     Heuristic check that a Gamma market is a BTC 5-minute up/down market.
-    Adjust the keyword set as Polymarket's naming conventions evolve.
+
+    Strategy:
+      1. Question or slug must mention BTC / Bitcoin.
+      2. Must include a 5-minute time-reference keyword OR follow the
+         Polymarket naming pattern for short-duration price markets
+         (e.g. "Will BTC be above $X at 2:05 PM?").
+      3. Must have a parseable end time that is divisible by 300 (validated
+         separately in find_btc_5min_markets, but we guard here too).
+
+    Adjust the keyword sets as Polymarket's naming conventions evolve.
     """
     q: str = market.get("question", "").lower()
     slug: str = market.get("slug", "").lower()
-    keywords = ("btc", "bitcoin")
-    time_kws = ("5-min", "5 min", "5min", "300s", "5-minute")
-    has_btc = any(k in q or k in slug for k in keywords)
-    has_time = any(k in q or k in slug for k in time_kws)
-    is_up_down = any(k in q for k in ("above", "below", "higher", "lower", "up", "down"))
-    return has_btc and (has_time or is_up_down)
+
+    # ── 1. BTC keyword ────────────────────────────────────────────────────────
+    btc_kws = ("btc", "bitcoin")
+    if not any(k in q or k in slug for k in btc_kws):
+        return False
+
+    # ── 2. Short-window time marker ───────────────────────────────────────────
+    # Explicit 5-min labels
+    time_kws = ("5-min", "5 min", "5min", "5-minute", "5 minute", "300s")
+    if any(k in q or k in slug for k in time_kws):
+        return True
+
+    # Polymarket "Will X be above/below Y at HH:MM?" pattern where HH:MM
+    # ends on a 5-minute boundary (e.g. ":05", ":10" … ":55").
+    # We match any ":X5" or ":X0" time reference as a proxy.
+    import re
+    if re.search(r":\d[05]\b", q) and any(k in q for k in ("above", "below", "higher", "lower")):
+        return True
+
+    logger.debug("_is_btc_5min_market: rejected (no time marker) – %s", q[:80])
+    return False
 
 
 def _parse_end_time(market: dict) -> Optional[int]:
@@ -592,17 +633,70 @@ def _parse_end_time(market: dict) -> Optional[int]:
     return None
 
 
-def _extract_tokens(market: dict) -> Optional[TokenPair]:
-    """Parse YES/NO token IDs from the market dict."""
-    # Polymarket encodes outcome tokens in different fields depending on API version
-    tokens = market.get("clobTokenIds") or market.get("clob_token_ids")
-    if tokens and len(tokens) >= 2:
-        return TokenPair(yes_token_id=str(tokens[0]), no_token_id=str(tokens[1]))
+def _parse_json_list(value) -> Optional[List]:
+    """
+    Return a Python list from either a native list or a JSON-encoded list string.
 
-    outcomes = market.get("outcomes", [])
-    token_ids = market.get("outcomePrices") or market.get("outcome_prices") or []
-    if len(outcomes) >= 2 and len(token_ids) >= 2:
-        return TokenPair(yes_token_id=str(token_ids[0]), no_token_id=str(token_ids[1]))
+    The Polymarket Gamma API encodes several array fields as JSON strings rather
+    than native JSON arrays.  For example, ``clobTokenIds`` arrives as:
+        ``'["71321045...", "52114319..."]'``
+    not as the Python list ``["71321045...", "52114319..."]``.
+
+    Returns ``None`` if the value cannot be parsed into a list.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
+
+
+def _extract_tokens(market: dict) -> Optional[TokenPair]:
+    """
+    Parse the YES/NO outcome token IDs from a Gamma market dict.
+
+    Tries three sources in priority order:
+
+    1. ``clobTokenIds`` – primary field; may be a JSON-encoded string or list.
+       Example (string):  '["71321...", "52114..."]'
+       Example (list):    ["71321...", "52114..."]
+
+    2. ``clob_token_ids`` – snake_case alias used by some API versions.
+
+    3. ``tokens`` – richer array where each element is a dict with a
+       ``token_id`` key.  Example:
+       [{"token_id": "71321...", "outcome": "Yes", ...},
+        {"token_id": "52114...", "outcome": "No",  ...}]
+
+    The first element is always the YES/UP outcome; the second is NO/DOWN.
+    """
+    # ── Source 1 & 2: clobTokenIds / clob_token_ids ───────────────────────────
+    for key in ("clobTokenIds", "clob_token_ids"):
+        raw = market.get(key)
+        if raw is None:
+            continue
+        ids = _parse_json_list(raw)
+        if ids and len(ids) >= 2 and ids[0] and ids[1]:
+            return TokenPair(yes_token_id=str(ids[0]), no_token_id=str(ids[1]))
+
+    # ── Source 3: tokens array ────────────────────────────────────────────────
+    raw_tokens = market.get("tokens")
+    if raw_tokens is not None:
+        tokens_list = _parse_json_list(raw_tokens)
+        if tokens_list and len(tokens_list) >= 2:
+            def _tid(t) -> str:
+                if isinstance(t, dict):
+                    return str(t.get("token_id") or t.get("id") or "")
+                return str(t)
+            yes_id = _tid(tokens_list[0])
+            no_id = _tid(tokens_list[1])
+            if yes_id and no_id:
+                return TokenPair(yes_token_id=yes_id, no_token_id=no_id)
 
     return None
 
