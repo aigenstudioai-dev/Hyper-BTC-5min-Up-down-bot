@@ -33,6 +33,7 @@ from api_client import (
     PolymarketAuth,
     PolymarketClient,
     PythPriceFeed,
+    PythWebSocketFeed,
     MarketInfo,
     OrderResult,
     seconds_until_close,
@@ -132,7 +133,8 @@ class HyperBTCBot:
         )
 
         self.client = PolymarketClient(auth, simulation=config.simulation_mode)
-        self.price_feed = PythPriceFeed()
+        self._ws_feed = PythWebSocketFeed()    # primary: low-latency WebSocket cache
+        self._rest_feed = PythPriceFeed()      # fallback: REST polling
 
         self.window_tracker = WindowTracker()
         self.signal_engine = SignalEngine(
@@ -167,18 +169,22 @@ class HyperBTCBot:
         logger.info("  Hyper-BTC 5-Minute Bot | Mode: %s", mode)
         logger.info("=" * 60)
 
+        await self._ws_feed.start()
         self._running = True
-        while self._running:
-            try:
-                await self._tick()
-            except KeyboardInterrupt:
-                logger.info("Keyboard interrupt – shutting down.")
-                self._running = False
-                break
-            except Exception as exc:
-                logger.error("Tick error (continuing): %s", exc, exc_info=True)
+        try:
+            while self._running:
+                try:
+                    await self._tick()
+                except KeyboardInterrupt:
+                    logger.info("Keyboard interrupt – shutting down.")
+                    self._running = False
+                    break
+                except Exception as exc:
+                    logger.error("Tick error (continuing): %s", exc, exc_info=True)
 
-            await asyncio.sleep(self.cfg.tick_interval_seconds)
+                await asyncio.sleep(self.cfg.tick_interval_seconds)
+        finally:
+            await self._ws_feed.stop()
 
         # Final summary
         logger.info(self.ledger.summary())
@@ -188,13 +194,21 @@ class HyperBTCBot:
         """Single iteration of the main loop."""
         now = time.time()
 
-        # 1. Fetch current BTC price
-        try:
-            price_data = self.price_feed.fetch_btc_price()
-            current_price = price_data.price
-        except RuntimeError as exc:
-            logger.error("Price feed error: %s", exc)
-            return
+        # 1. Fetch current BTC price.
+        #    Prefer the WebSocket cache (sub-millisecond, no I/O).
+        #    Fall back to REST if the cache is absent or stale (>10 s).
+        price_data = self._ws_feed.get_latest()
+        if price_data is None or self._ws_feed.is_stale(max_age_seconds=10.0):
+            try:
+                price_data = self._rest_feed.fetch_btc_price()
+                if self._ws_feed.is_stale(max_age_seconds=10.0):
+                    logger.debug(
+                        "Price: REST fallback (WS stale) – %.2f", price_data.price
+                    )
+            except RuntimeError as exc:
+                logger.error("Price feed error (both WS and REST failed): %s", exc)
+                return
+        current_price = price_data.price
 
         # 2. Update window open tracker
         self.window_tracker.record_tick(current_price, ts=now)

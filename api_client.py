@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -557,6 +558,198 @@ class PythPriceFeed:
     @property
     def last_price(self) -> Optional[float]:
         return self._last.price if self._last else None
+
+
+# ─── Pyth WebSocket feed ───────────────────────────────────────────────────────
+
+
+class PythWebSocketFeed:
+    """
+    Real-time BTC/USD price feed via Pyth Hermes WebSocket.
+
+    Maintains a single persistent WebSocket connection to Hermes and
+    updates an in-memory price cache on every incoming ``price_update``
+    message.  The bot reads the cache synchronously via ``get_latest()``
+    so no ``await`` is needed in the hot tick loop.
+
+    Lifecycle
+    ---------
+    feed = PythWebSocketFeed()
+    await feed.start()           # starts background asyncio Task
+    price = feed.get_latest()    # synchronous cache read (no I/O)
+    feed.is_stale(max_age=10)    # True if cache is absent or too old
+    await feed.stop()            # cancel the Task gracefully
+
+    Reconnect policy
+    ----------------
+    On any error (network, parse, server-close) the listener sleeps
+    with full-jitter exponential back-off capped at MAX_RECONNECT_DELAY,
+    then reconnects.  The ``_last`` cache is preserved across reconnects
+    so callers always have the most recent valid price.
+
+    Hermes WebSocket message format
+    --------------------------------
+    Subscription request::
+
+        {"type": "subscribe", "ids": ["e62df6c8b4a8..."]}
+
+    Price-update push::
+
+        {
+          "type": "price_update",
+          "price_feed": {
+            "id": "e62df6c8...",
+            "price": {
+              "price":        "6500000000000",
+              "conf":         "500000000",
+              "expo":         -8,
+              "publish_time": 1713189900
+            }
+          }
+        }
+
+    Price calculation: ``price_usd = float(price) × 10^expo``
+    For BTC at $65,000: 6500000000000 × 10⁻⁸ = 65000.0
+    """
+
+    WS_URL = "wss://hermes.pyth.network/ws"
+    MAX_RECONNECT_DELAY: float = 30.0
+
+    def __init__(self) -> None:
+        self._last: Optional[PriceData] = None
+        self._connected: bool = False
+        self._task: Optional[asyncio.Task] = None
+
+    # ── Public interface ──────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """Start the background WebSocket listener task."""
+        if self._task and not self._task.done():
+            return   # already running
+        self._task = asyncio.create_task(
+            self._run_forever(), name="pyth-ws-feed"
+        )
+        logger.info("PythWebSocketFeed: listener task started")
+
+    async def stop(self) -> None:
+        """Cancel the background task and wait for it to finish."""
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._connected = False
+        logger.info("PythWebSocketFeed: stopped")
+
+    def get_latest(self) -> Optional[PriceData]:
+        """
+        Return the most recently received price.
+        Returns ``None`` before the first message arrives.
+        This method is synchronous — it reads a Python object, no I/O.
+        """
+        return self._last
+
+    def is_stale(self, max_age_seconds: float = 10.0) -> bool:
+        """
+        True if no price has been cached yet, or if the cached price is
+        older than ``max_age_seconds``.
+        """
+        if self._last is None:
+            return True
+        return (time.time() - self._last.timestamp) > max_age_seconds
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def last_price(self) -> Optional[float]:
+        """Compatibility shim matching the PythPriceFeed interface."""
+        return self._last.price if self._last else None
+
+    # ── Internal reconnect loop ───────────────────────────────────────────────
+
+    async def _run_forever(self) -> None:
+        """Reconnect loop with full-jitter exponential back-off."""
+        delay = 1.0
+        while True:
+            try:
+                await self._connect_and_stream()
+                delay = 1.0   # successful clean disconnect → reset delay
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._connected = False
+                jittered = random.uniform(0.0, min(self.MAX_RECONNECT_DELAY, delay))
+                logger.warning(
+                    "PythWebSocketFeed: disconnected – reconnecting in %.1fs: %s",
+                    jittered, exc,
+                )
+                await asyncio.sleep(jittered)
+                delay = min(self.MAX_RECONNECT_DELAY, delay * 2.0)
+
+    async def _connect_and_stream(self) -> None:
+        """Open one WebSocket session, subscribe, and stream messages."""
+        import websockets  # imported here so the module loads without it
+
+        async with websockets.connect(
+            self.WS_URL,
+            ping_interval=20,
+            ping_timeout=10,
+        ) as ws:
+            feed_id = BTC_USD_FEED_ID.lstrip("0x")
+            await ws.send(json.dumps({"type": "subscribe", "ids": [feed_id]}))
+            self._connected = True
+            logger.info("PythWebSocketFeed: connected and subscribed (feed=%s…)", feed_id[:8])
+
+            async for raw in ws:
+                try:
+                    price = self._parse_message(json.loads(raw))
+                    if price is not None:
+                        self._last = price
+                        logger.debug(
+                            "PythWebSocketFeed: %.2f USD (conf ±%.2f)",
+                            price.price, price.confidence,
+                        )
+                except Exception as exc:
+                    logger.debug("PythWebSocketFeed: message parse error: %s", exc)
+
+    # ── Message parser (pure, no side-effects) ────────────────────────────────
+
+    def _parse_message(self, msg: dict) -> Optional[PriceData]:
+        """
+        Parse a Hermes ``price_update`` dict into a ``PriceData`` object.
+        Returns ``None`` for non-price messages or malformed payloads.
+        """
+        if msg.get("type") != "price_update":
+            return None
+
+        feed = msg.get("price_feed") or {}
+        price_obj = feed.get("price") or {}
+        if not price_obj:
+            return None
+
+        try:
+            raw_price = float(price_obj["price"])
+            expo      = int(price_obj["expo"])
+            conf      = float(price_obj.get("conf", 0))
+            pub_time  = int(price_obj.get("publish_time", time.time()))
+        except (KeyError, ValueError, TypeError):
+            return None
+
+        price_usd = raw_price * (10 ** expo)
+        conf_usd  = conf      * (10 ** expo)
+
+        if not (price_usd > 0):   # rejects 0, negatives, and NaN
+            return None
+
+        return PriceData(
+            price=price_usd,
+            confidence=conf_usd,
+            timestamp=pub_time,
+            feed_id=BTC_USD_FEED_ID,
+        )
 
 
 # ─── Helper utilities ──────────────────────────────────────────────────────────
