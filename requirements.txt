@@ -5,3 +5,4 @@ web3==6.15.1
 eth-account==0.10.0
 python-dotenv==1.0.1
 numpy==1.26.4
+pytest==8.1.1
