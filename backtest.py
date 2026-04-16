@@ -41,6 +41,7 @@ from typing import Dict, List, Optional
 import requests
 
 from strategy import DrawdownGuard, KellySizer, SignalEngine, SignalType
+from utils import http_retry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -174,27 +175,21 @@ def fetch_bars(from_ts: int, to_ts: int, chunk_days: int = 7) -> List[Bar]:
         chunk_end = min(cursor + chunk_secs, to_ts)
         logger.info("  Fetching %s → %s", _fmt(cursor), _fmt(chunk_end))
 
-        for attempt in range(3):
-            try:
-                resp = session.get(
-                    f"{BENCHMARKS_BASE}/v1/shims/tradingview/history",
-                    params={
-                        "symbol": BTC_SYMBOL,
-                        "resolution": RESOLUTION,
-                        "from": cursor,
-                        "to": chunk_end,
-                    },
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                break
-            except Exception as exc:
-                wait = 2 ** attempt
-                logger.warning("    Attempt %d failed: %s – retrying in %ds", attempt + 1, exc, wait)
-                time.sleep(wait)
-        else:
-            logger.error("    Chunk %s–%s failed after 3 attempts – skipping.", _fmt(cursor), _fmt(chunk_end))
+        try:
+            resp = http_retry(
+                session, "GET",
+                f"{BENCHMARKS_BASE}/v1/shims/tradingview/history",
+                params={
+                    "symbol": BTC_SYMBOL,
+                    "resolution": RESOLUTION,
+                    "from": cursor,
+                    "to": chunk_end,
+                },
+                timeout=30,
+            )
+            data = resp.json()
+        except Exception as exc:
+            logger.error("    Chunk %s–%s failed: %s – skipping.", _fmt(cursor), _fmt(chunk_end), exc)
             cursor = chunk_end
             continue
 

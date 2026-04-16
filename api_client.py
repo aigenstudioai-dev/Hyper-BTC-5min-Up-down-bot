@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from eth_account import Account
+from utils import http_retry
 from eth_account.messages import encode_defunct
 from eth_account.signers.local import LocalAccount
 
@@ -229,23 +230,24 @@ class PolymarketClient:
             headers = self.auth.l1_headers()
         elif auth_level == 2:
             headers = self.auth.l2_headers("GET", path)
-        resp = self._session.get(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
+        resp = http_retry(self._session, "GET", url, params=params, headers=headers, timeout=10)
         return resp.json()
 
     def _post(self, path: str, body: dict, auth_level: int = 2) -> dict:
         body_str = json.dumps(body, separators=(",", ":"))
         headers = self.auth.l2_headers("POST", path, body_str)
-        resp = self._session.post(
-            CLOB_BASE_URL + path, data=body_str, headers=headers, timeout=10
+        resp = http_retry(
+            self._session, "POST", CLOB_BASE_URL + path,
+            data=body_str, headers=headers, timeout=10,
         )
-        resp.raise_for_status()
         return resp.json()
 
     def _delete(self, path: str, auth_level: int = 2) -> dict:
         headers = self.auth.l2_headers("DELETE", path)
-        resp = self._session.delete(CLOB_BASE_URL + path, headers=headers, timeout=10)
-        resp.raise_for_status()
+        resp = http_retry(
+            self._session, "DELETE", CLOB_BASE_URL + path,
+            headers=headers, timeout=10,
+        )
         return resp.json()
 
     # ── API key derivation ────────────────────────────────────────────────────
@@ -256,12 +258,10 @@ class PolymarketClient:
         Call this once and persist the result to your .env file.
         """
         headers = self.auth.l1_headers()
-        resp = self._session.post(
-            CLOB_BASE_URL + "/auth/api-key",
-            headers=headers,
-            timeout=15,
+        resp = http_retry(
+            self._session, "POST", CLOB_BASE_URL + "/auth/api-key",
+            headers=headers, timeout=15,
         )
-        resp.raise_for_status()
         creds = resp.json()
         logger.info("API credentials derived for address %s", self.auth.address)
         return creds  # {"apiKey": ..., "secret": ..., "passphrase": ...}
