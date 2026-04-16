@@ -41,6 +41,12 @@ PYTH_HERMES_URL: str = os.getenv("PYTH_HERMES_URL", "https://hermes.pyth.network
 CLOB_EXCHANGE: str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 CHAIN_ID: int = 137  # Polygon
 
+# USDC on Polygon used by Polymarket (USDC.e – Bridged USDC)
+# Native USDC alternative: 0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359
+USDC_ADDRESS: str = os.getenv(
+    "USDC_ADDRESS", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+)
+
 # Pyth BTC/USD feed ID (verified via https://pyth.network/price-feeds)
 BTC_USD_FEED_ID: str = (
     "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"
