@@ -39,6 +39,7 @@ from api_client import (
     seconds_until_close,
     _next_window_close,
 )
+from db import OrderStore
 from strategy import (
     DrawdownGuard,
     KellySizer,
@@ -153,6 +154,9 @@ class HyperBTCBot:
         # Simulation ledger (used even in live mode for record-keeping)
         self.ledger = SimulationLedger(starting_usdc=config.starting_bankroll)
 
+        # Order persistence
+        self.order_store = OrderStore()
+
         # Active state
         self._active_market: Optional[MarketInfo] = None
         self._open_orders: Dict[str, OrderResult] = {}    # order_id → result
@@ -170,6 +174,7 @@ class HyperBTCBot:
         logger.info("=" * 60)
 
         await self._ws_feed.start()
+        self._reconcile_open_orders()
         self._running = True
         try:
             while self._running:
@@ -185,6 +190,7 @@ class HyperBTCBot:
                 await asyncio.sleep(self.cfg.tick_interval_seconds)
         finally:
             await self._ws_feed.stop()
+            self.order_store.close()
 
         # Final summary
         logger.info(self.ledger.summary())
@@ -328,6 +334,16 @@ class HyperBTCBot:
 
         self._open_orders[result.order_id] = result
 
+        # Persist order before it can be lost on crash
+        self.order_store.insert_order(
+            order_id=result.order_id,
+            token_id=signal.recommended_token,
+            side="BUY",
+            entry_price=signal.recommended_price,
+            size_usdc=size_usdc,
+            window_end=market.end_time,
+        )
+
         # Track in simulation ledger
         record = TradeRecord(
             trade_id=result.order_id,
@@ -354,11 +370,13 @@ class HyperBTCBot:
 
             if status.status in ("matched", "filled"):
                 logger.info("Order %s filled.", order_id)
+                self.order_store.update_status(order_id, "filled")
                 del self._open_orders[order_id]
                 continue
 
             if status.status == "error":
                 logger.warning("Order %s error: %s", order_id, status.error)
+                self.order_store.update_status(order_id, "cancelled")
                 del self._open_orders[order_id]
                 continue
 
@@ -375,6 +393,7 @@ class HyperBTCBot:
                     "Order %s stale after %.0fs – cancel and replace.", order_id, age
                 )
                 self.client.cancel_order(order_id)
+                self.order_store.update_status(order_id, "cancelled")
                 del self._open_orders[order_id]
 
                 # Replace at updated mid
@@ -408,7 +427,11 @@ class HyperBTCBot:
 
         if self.cfg.simulation_mode:
             for trade_id in self.ledger.open_trade_ids[:]:
-                self.ledger.settle_trade(trade_id, open_price, close_price)
+                settled = self.ledger.settle_trade(trade_id, open_price, close_price)
+                if settled is not None:
+                    self.order_store.update_status(
+                        trade_id, "settled", pnl_usdc=settled.pnl_usdc
+                    )
             logger.info(self.ledger.summary())
 
         # Reset window state
@@ -457,6 +480,69 @@ class HyperBTCBot:
         market.no_bid = no_book["bid"]
         market.no_ask = no_book["ask"]
         return market
+
+    # ── Crash-recovery ────────────────────────────────────────────────────────
+
+    def _reconcile_open_orders(self) -> None:
+        """
+        Called once at startup.  Reads all ``open`` rows from the DB and
+        reconciles each against the live CLOB API (or simulation state).
+
+        Outcomes:
+          • Window already closed → mark cancelled (we can no longer trade it).
+          • CLOB says filled     → mark filled.
+          • CLOB says cancelled  → mark cancelled.
+          • CLOB says still open → put back into self._open_orders so the
+            manage loop can handle it normally (cancel-replace if stale).
+          • Any error querying CLOB → leave as open, bot will retry next tick.
+        """
+        rows = self.order_store.get_open_orders()
+        if not rows:
+            return
+
+        logger.info("Reconciling %d open order(s) from previous session…", len(rows))
+        now = int(time.time())
+
+        for row in rows:
+            order_id  = row["order_id"]
+            window_end = row["window_end"]
+
+            # Window has already closed – order is unresolvable
+            if window_end < now:
+                logger.warning(
+                    "Recovered order %s: window expired at %d – marking cancelled",
+                    order_id, window_end,
+                )
+                self.order_store.update_status(order_id, "cancelled")
+                continue
+
+            if self.cfg.simulation_mode:
+                # In sim mode the CLOB is not real; just restore into memory
+                logger.info("Recovered SIM order %s – restored to open orders", order_id)
+                continue
+
+            try:
+                status = self.client.get_order_status(order_id)
+            except Exception as exc:
+                logger.error(
+                    "Reconcile: could not query CLOB for %s: %s – leaving open",
+                    order_id, exc,
+                )
+                continue
+
+            if status.status in ("matched", "filled"):
+                logger.info("Recovered order %s: was filled – updating DB", order_id)
+                self.order_store.update_status(order_id, "filled")
+            elif status.status in ("cancelled", "error", "expired"):
+                logger.info(
+                    "Recovered order %s: status=%s – updating DB", order_id, status.status
+                )
+                self.order_store.update_status(order_id, "cancelled")
+            else:
+                logger.info(
+                    "Recovered order %s: still open – re-adding to active orders",
+                    order_id,
+                )
 
 
 # ─── CLI entry point ───────────────────────────────────────────────────────────
