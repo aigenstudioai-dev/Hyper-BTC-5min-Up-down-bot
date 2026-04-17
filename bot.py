@@ -517,8 +517,14 @@ class HyperBTCBot:
                 continue
 
             if self.cfg.simulation_mode:
-                # In sim mode the CLOB is not real; just restore into memory
-                logger.info("Recovered SIM order %s – restored to open orders", order_id)
+                # In sim mode the CLOB is not real; put the order back into the
+                # in-memory dict so _manage_open_orders can cancel it if stale.
+                self._open_orders[order_id] = OrderResult(
+                    order_id=order_id,
+                    status="open",
+                    error=None,
+                )
+                logger.info("Recovered SIM order %s – restored to active orders", order_id)
                 continue
 
             try:
@@ -539,8 +545,13 @@ class HyperBTCBot:
                 )
                 self.order_store.update_status(order_id, "cancelled")
             else:
+                self._open_orders[order_id] = OrderResult(
+                    order_id=order_id,
+                    status="open",
+                    error=None,
+                )
                 logger.info(
-                    "Recovered order %s: still open – re-adding to active orders",
+                    "Recovered order %s: still open – re-added to active orders",
                     order_id,
                 )
 
