@@ -40,6 +40,15 @@ from api_client import (
     _next_window_close,
 )
 from db import OrderStore
+from notifier import (
+    build_notifier_from_env,
+    fmt_entry,
+    fmt_halt,
+    fmt_settle_loss,
+    fmt_settle_win,
+    fmt_shutdown,
+    fmt_startup,
+)
 from strategy import (
     DrawdownGuard,
     KellySizer,
@@ -157,6 +166,9 @@ class HyperBTCBot:
         # Order persistence
         self.order_store = OrderStore()
 
+        # Trade alert notifications (Telegram / Discord / null)
+        self.notifier = build_notifier_from_env()
+
         # Active state
         self._active_market: Optional[MarketInfo] = None
         self._open_orders: Dict[str, OrderResult] = {}    # order_id → result
@@ -175,6 +187,9 @@ class HyperBTCBot:
 
         await self._ws_feed.start()
         self._reconcile_open_orders()
+        self.notifier.send(
+            fmt_startup(mode, self.ledger.balance)
+        )
         self._running = True
         try:
             while self._running:
@@ -193,8 +208,15 @@ class HyperBTCBot:
             self.order_store.close()
 
         # Final summary
-        logger.info(self.ledger.summary())
+        summary = self.ledger.summary()
+        logger.info(summary)
         logger.info(self.drawdown_guard.status_line())
+        n_trades  = len(self.ledger.trades)
+        wins      = sum(1 for t in self.ledger.trades if t.pnl_usdc and t.pnl_usdc > 0)
+        win_rate  = wins / n_trades if n_trades else 0.0
+        self.notifier.send(
+            fmt_shutdown(self.ledger.balance, n_trades, win_rate)
+        )
 
     async def _tick(self) -> None:
         """Single iteration of the main loop."""
@@ -244,6 +266,13 @@ class HyperBTCBot:
         self.drawdown_guard.update(current_balance)
         if self.drawdown_guard.is_halted:
             logger.warning("Bot halted by drawdown guard.")
+            self.notifier.send(
+                fmt_halt(
+                    self.drawdown_guard.drawdown,
+                    self.cfg.max_drawdown,
+                    current_balance,
+                )
+            )
             self._running = False
             return
 
@@ -344,6 +373,17 @@ class HyperBTCBot:
             window_end=market.end_time,
         )
 
+        # Notify
+        self.notifier.send(
+            fmt_entry(
+                signal_type=signal.signal_type.value,
+                size_usdc=size_usdc,
+                price=signal.recommended_price,
+                token_id=signal.recommended_token,
+                window_end=market.end_time,
+            )
+        )
+
         # Track in simulation ledger
         record = TradeRecord(
             trade_id=result.order_id,
@@ -429,9 +469,18 @@ class HyperBTCBot:
             for trade_id in self.ledger.open_trade_ids[:]:
                 settled = self.ledger.settle_trade(trade_id, open_price, close_price)
                 if settled is not None:
+                    pnl = settled.pnl_usdc or 0.0
                     self.order_store.update_status(
-                        trade_id, "settled", pnl_usdc=settled.pnl_usdc
+                        trade_id, "settled", pnl_usdc=pnl
                     )
+                    if pnl > 0:
+                        self.notifier.send(
+                            fmt_settle_win(settled.entry_usdc, pnl, self.ledger.balance)
+                        )
+                    else:
+                        self.notifier.send(
+                            fmt_settle_loss(settled.entry_usdc, self.ledger.balance)
+                        )
             logger.info(self.ledger.summary())
 
         # Reset window state
