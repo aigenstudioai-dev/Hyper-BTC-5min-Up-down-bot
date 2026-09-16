@@ -17,6 +17,9 @@ env/
 # Pytest
 .pytest_cache/
 
+# Runtime order database
+orders.db
+
 # Distribution / packaging
 dist/
 build/

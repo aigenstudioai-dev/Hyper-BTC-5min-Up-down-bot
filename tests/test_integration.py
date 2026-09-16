@@ -168,7 +168,7 @@ class TestBotSimulationIntegration:
         """
         import os
         os.environ.setdefault("SIMULATION_MODE", "true")
-        os.environ.setdefault("PRIVATE_KEY",     "0x" + "0" * 64)
+        os.environ.setdefault("PRIVATE_KEY",     "0x" + "0" * 63 + "1")
         os.environ.setdefault("POLY_API_KEY",    "test")
         os.environ.setdefault("POLY_API_SECRET", "test")
         os.environ.setdefault("POLY_API_PASSPHRASE", "test")
@@ -177,7 +177,7 @@ class TestBotSimulationIntegration:
 
         config = BotConfig(
             simulation_mode   = True,
-            private_key       = "0x" + "0" * 64,
+            private_key       = "0x" + "0" * 63 + "1",
             kelly_fraction    = 0.25,
             starting_bankroll = 300.0,
             tick_interval_seconds = 0.1,
