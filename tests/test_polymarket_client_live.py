@@ -8,9 +8,9 @@ seam every _get/_post/_delete call funnels through — nothing here touches
 the network.
 
 place_limit_order's tests mock `client.auth.sign_order` directly: the
-signer itself is separately covered (and currently known-broken — see
-issue #5 / tests/test_polymarket_auth.py::TestSignOrder) so these tests
-isolate order-construction/dispatch correctness from that known break.
+signer itself is separately covered in
+tests/test_polymarket_auth.py::TestSignOrder, so these tests isolate
+order-construction/dispatch correctness from signing.
 """
 
 from __future__ import annotations

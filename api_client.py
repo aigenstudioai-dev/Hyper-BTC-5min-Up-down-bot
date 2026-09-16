@@ -198,7 +198,11 @@ class PolymarketAuth:
             "primaryType": "Order",
             "message": order,
         }
-        signed = self.account.sign_typed_data(
+        # LocalAccount has no sign_typed_data instance method on the pinned
+        # eth-account==0.10.0 — it only exists as an Account classmethod
+        # taking the raw private key. See issue #5.
+        signed = Account.sign_typed_data(
+            self.account.key,
             domain_data=domain,
             message_types={"Order": types["Order"]},
             message_data=order,

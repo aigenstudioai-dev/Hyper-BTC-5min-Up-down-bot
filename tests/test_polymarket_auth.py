@@ -5,11 +5,11 @@ Covers issue #4 (wallet-signing coverage backfill). Uses a real throwaway
 private key so the actual signing code runs; nothing here touches the
 network.
 
-`sign_order` is expected to currently crash — see issue #5
-(PolymarketAuth.sign_order calls LocalAccount.sign_typed_data, which does
-not exist on eth-account==0.10.0's LocalAccount). That test is marked
-xfail so it documents the break without failing the suite, and will flip
-to an unexpected pass the moment #5 is fixed.
+`sign_order` previously crashed (issue #5: it called
+LocalAccount.sign_typed_data, which does not exist on eth-account==0.10.0's
+LocalAccount) and now calls Account.sign_typed_data(self.account.key, ...)
+instead. TestSignOrder verifies the fix by recovering the signer address
+from the returned signature.
 """
 
 from __future__ import annotations
@@ -105,7 +105,11 @@ class TestL2Headers:
 
 
 class TestSignOrder:
-    """See issue #5 — sign_order currently crashes on eth-account==0.10.0."""
+    """
+    Issue #5 (fixed): sign_order used to call the non-existent
+    LocalAccount.sign_typed_data instance method on eth-account==0.10.0.
+    It now calls Account.sign_typed_data(self.account.key, ...) instead.
+    """
 
     ORDER = {
         "salt": 12345,
@@ -122,11 +126,6 @@ class TestSignOrder:
         "signatureType": 0,
     }
 
-    @pytest.mark.xfail(
-        reason="issue #5: LocalAccount has no sign_typed_data on eth-account==0.10.0",
-        raises=AttributeError,
-        strict=True,
-    )
     def test_signature_recovers_to_wallet_address(self, auth):
         order = {**self.ORDER, "maker": auth.address, "signer": auth.address}
         signature = auth.sign_order(order)
@@ -156,3 +155,8 @@ class TestSignOrder:
         signable = encode_typed_data(domain_data=domain, message_types=types, message_data=order)
         recovered = Account.recover_message(signable, signature=signature)
         assert recovered == auth.address
+
+    def test_different_orders_produce_different_signatures(self, auth):
+        order_a = {**self.ORDER, "maker": auth.address, "signer": auth.address, "salt": 1}
+        order_b = {**self.ORDER, "maker": auth.address, "signer": auth.address, "salt": 2}
+        assert auth.sign_order(order_a) != auth.sign_order(order_b)
