@@ -1,0 +1,13 @@
+services:
+  hyper-btc-bot:
+    build: .
+    container_name: hyper-btc-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist crash-recovery state across container restarts/rebuilds.
+      - ./orders.db:/app/orders.db
+    # Simulation mode by default (matches SIMULATION_MODE in .env).
+    # Switch to ["python", "bot.py", "--live"] only once go_live.py passes.
+    command: ["python", "bot.py"]

@@ -1,0 +1,31 @@
+# systemd unit for running the bot directly on a VPS (no Docker).
+#
+# Install:
+#   sudo cp deploy/hyper-btc-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hyper-btc-bot
+#
+# Watch logs:
+#   journalctl -u hyper-btc-bot -f
+#
+# Edit the paths below (WorkingDirectory, ExecStart, User) to match your
+# actual install location and the user you want the bot to run as.
+# Start with simulation mode (plain `bot.py`); only add `--live` once
+# go_live.py has passed and you've reviewed the paper-trading results.
+
+[Unit]
+Description=Hyper-BTC 5-Minute Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/hyper-btc-bot
+EnvironmentFile=/opt/hyper-btc-bot/.env
+ExecStart=/opt/hyper-btc-bot/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
