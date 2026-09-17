@@ -43,9 +43,11 @@ def client() -> PolymarketClient:
 
 class TestPlaceLimitOrderLive:
 
-    def test_order_struct_fields(self, client):
+    def test_signed_struct_has_v2_fields_only(self, client):
+        """CLOB V2 (issue #7): the EIP-712 signed struct drops taker/
+        expiration/nonce/feeRateBps and adds timestamp/metadata/builder."""
         client.auth.sign_order = MagicMock(return_value="0xdeadbeef")
-        before = int(time.time())
+        before_ms = int(time.time() * 1000)
 
         with patch("api_client.http_retry", return_value=make_response({"orderID": "OID-1"})) as mock_retry:
             client.place_limit_order(
@@ -53,21 +55,23 @@ class TestPlaceLimitOrderLive:
             )
 
         order = client.auth.sign_order.call_args[0][0]
+        assert set(order.keys()) == {
+            "salt", "maker", "signer", "tokenId", "makerAmount", "takerAmount",
+            "side", "signatureType", "timestamp", "metadata", "builder",
+        }
         assert 0 <= order["salt"] < 2 ** 256
         assert order["maker"] == client.auth.address
         assert order["signer"] == client.auth.address
-        assert order["taker"] == "0x0000000000000000000000000000000000000000"
         assert order["tokenId"] == int(TOKEN_ID)
         assert order["makerAmount"] == 25_000_000            # 25 USDC * 1e6
         assert order["takerAmount"] == int(25.0 / 0.60 * 1e6)
-        assert before + 10 <= order["expiration"] <= before + 11
-        assert order["nonce"] == 0
-        assert order["feeRateBps"] == 0
         assert order["side"] == 0                             # BUY
         assert order["signatureType"] == 0
+        assert before_ms <= order["timestamp"] <= before_ms + 1000
+        assert order["metadata"] == "0x" + "0" * 64
+        assert order["builder"] == "0x" + "0" * 64
 
         # http_retry was called with a POST to /order carrying the signed payload
-        _, kwargs = mock_retry.call_args
         assert mock_retry.call_args[0][1] == "POST"
         assert mock_retry.call_args[0][2].endswith("/order")
 
@@ -79,14 +83,39 @@ class TestPlaceLimitOrderLive:
         assert order["side"] == 1
 
     def test_post_payload_shape(self, client):
+        """CLOB V2 wire body (issue #7): drops taker/nonce/feeRateBps but
+        keeps expiration (GTD wire-level handling, not part of the signed
+        struct); adds timestamp/metadata/builder, plus top-level owner and
+        postOnly. side is the string "BUY"/"SELL" on the wire even though
+        the signed struct uses a uint8."""
         client.auth.sign_order = MagicMock(return_value="0xSIGNATURE")
+        before = int(time.time())
         with patch("api_client.http_retry", return_value=make_response({"orderID": "OID-1"})) as mock_retry:
-            client.place_limit_order(token_id=TOKEN_ID, side="BUY", price=0.60, size_usdc=25.0)
+            client.place_limit_order(token_id=TOKEN_ID, side="BUY", price=0.60, size_usdc=25.0, expiry_seconds=10)
         import json
         body = json.loads(mock_retry.call_args.kwargs["data"])
-        assert body["signature"] == "0xSIGNATURE"
-        assert body["orderType"] == "LIMIT"
-        assert "order" in body
+
+        assert body["owner"] == client.auth.api_key
+        # GTD, not GTC: this bot relies on `expiration` as an exchange-side
+        # backstop if bot-side cancel-replace can't fire; GTC would ignore it.
+        assert body["orderType"] == "GTD"
+        assert body["postOnly"] is False
+
+        order = body["order"]
+        assert order["signature"] == "0xSIGNATURE"
+        assert order["side"] == "BUY"
+        assert "taker" not in order
+        assert "nonce" not in order
+        assert "feeRateBps" not in order
+        assert int(order["expiration"]) >= before + 10
+        assert isinstance(order["timestamp"], str) and int(order["timestamp"]) > 0
+        assert order["metadata"] == "0x" + "0" * 64
+        assert order["builder"] == "0x" + "0" * 64
+        # large uint256-range fields are stringified for JSON transport
+        assert isinstance(order["salt"], str)
+        assert isinstance(order["makerAmount"], str)
+        assert isinstance(order["takerAmount"], str)
+        assert isinstance(order["tokenId"], str)
 
     def test_success_returns_live_order_result(self, client):
         client.auth.sign_order = MagicMock(return_value="0xdeadbeef")

@@ -109,21 +109,25 @@ class TestSignOrder:
     Issue #5 (fixed): sign_order used to call the non-existent
     LocalAccount.sign_typed_data instance method on eth-account==0.10.0.
     It now calls Account.sign_typed_data(self.account.key, ...) instead.
+
+    Issue #7: CLOB V2 migration (docs.polymarket.com/v2-migration).
+    EIP-712 domain version "1" -> "2", verifyingContract moved to the V2
+    exchange, and the signed Order struct drops taker/expiration/nonce/
+    feeRateBps in favor of timestamp/metadata/builder.
     """
 
     ORDER = {
         "salt": 12345,
         "maker": "0x0000000000000000000000000000000000000001",
         "signer": "0x0000000000000000000000000000000000000001",
-        "taker": "0x0000000000000000000000000000000000000000",
         "tokenId": 71321045,
         "makerAmount": 25_000_000,
         "takerAmount": 41_666_666,
-        "expiration": 1_234_567_890,
-        "nonce": 0,
-        "feeRateBps": 0,
         "side": 0,
         "signatureType": 0,
+        "timestamp": 1_713_398_400_000,
+        "metadata": "0x" + "0" * 64,
+        "builder": "0x" + "0" * 64,
     }
 
     def test_signature_recovers_to_wallet_address(self, auth):
@@ -131,6 +135,41 @@ class TestSignOrder:
         signature = auth.sign_order(order)
 
         domain = {
+            "name": "Polymarket CTF Exchange",
+            "version": "2",
+            "chainId": CHAIN_ID,
+            "verifyingContract": CLOB_EXCHANGE,
+        }
+        types = {
+            "Order": [
+                {"name": "salt", "type": "uint256"},
+                {"name": "maker", "type": "address"},
+                {"name": "signer", "type": "address"},
+                {"name": "tokenId", "type": "uint256"},
+                {"name": "makerAmount", "type": "uint256"},
+                {"name": "takerAmount", "type": "uint256"},
+                {"name": "side", "type": "uint8"},
+                {"name": "signatureType", "type": "uint8"},
+                {"name": "timestamp", "type": "uint256"},
+                {"name": "metadata", "type": "bytes32"},
+                {"name": "builder", "type": "bytes32"},
+            ]
+        }
+        signable = encode_typed_data(domain_data=domain, message_types=types, message_data=order)
+        recovered = Account.recover_message(signable, signature=signature)
+        assert recovered == auth.address
+
+    def test_exchange_address_is_v2(self):
+        assert CLOB_EXCHANGE == "0xE111180000d2663C0091e4f400237545B87B996B"
+
+    def test_signature_does_not_recover_under_v1_domain(self, auth):
+        """Negative control: proves sign_order actually uses domain
+        version "2", not "1" — recovering under the old V1 domain must
+        NOT match the signer's address."""
+        order = {**self.ORDER, "maker": auth.address, "signer": auth.address}
+        signature = auth.sign_order(order)
+
+        v1_domain = {
             "name": "Polymarket CTF Exchange",
             "version": "1",
             "chainId": CHAIN_ID,
@@ -141,20 +180,19 @@ class TestSignOrder:
                 {"name": "salt", "type": "uint256"},
                 {"name": "maker", "type": "address"},
                 {"name": "signer", "type": "address"},
-                {"name": "taker", "type": "address"},
                 {"name": "tokenId", "type": "uint256"},
                 {"name": "makerAmount", "type": "uint256"},
                 {"name": "takerAmount", "type": "uint256"},
-                {"name": "expiration", "type": "uint256"},
-                {"name": "nonce", "type": "uint256"},
-                {"name": "feeRateBps", "type": "uint256"},
                 {"name": "side", "type": "uint8"},
                 {"name": "signatureType", "type": "uint8"},
+                {"name": "timestamp", "type": "uint256"},
+                {"name": "metadata", "type": "bytes32"},
+                {"name": "builder", "type": "bytes32"},
             ]
         }
-        signable = encode_typed_data(domain_data=domain, message_types=types, message_data=order)
+        signable = encode_typed_data(domain_data=v1_domain, message_types=types, message_data=order)
         recovered = Account.recover_message(signable, signature=signature)
-        assert recovered == auth.address
+        assert recovered != auth.address
 
     def test_different_orders_produce_different_signatures(self, auth):
         order_a = {**self.ORDER, "maker": auth.address, "signer": auth.address, "salt": 1}

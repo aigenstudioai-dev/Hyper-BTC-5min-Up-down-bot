@@ -37,11 +37,18 @@ CLOB_BASE_URL: str = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com")
 GAMMA_BASE_URL: str = os.getenv("GAMMA_BASE_URL", "https://gamma-api.polymarket.com")
 PYTH_HERMES_URL: str = os.getenv("PYTH_HERMES_URL", "https://hermes.pyth.network")
 
-# Polymarket CTF Exchange on Polygon mainnet
-CLOB_EXCHANGE: str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+# Polymarket CTF Exchange on Polygon mainnet — CLOB V2 (live since
+# 2026-04-28; V1 orders/signatures are no longer accepted in production).
+# See docs.polymarket.com/v2-migration. The NegRisk exchange address
+# (0xe2222d279d744050d28e00520010520000310F59) is unused: this bot only
+# trades plain two-outcome BTC 5-min Up/Down markets, never NegRisk ones.
+CLOB_EXCHANGE: str = "0xE111180000d2663C0091e4f400237545B87B996B"
 CHAIN_ID: int = 137  # Polygon
 
-# USDC on Polygon used by Polymarket (USDC.e – Bridged USDC)
+# USDC on Polygon used by Polymarket (USDC.e – Bridged USDC).
+# NOTE: CLOB V2 settles in pUSD, not USDC.e directly — see issue #9. This
+# address is still the correct one to *approve* for wrapping into pUSD via
+# the Collateral Onramp; it is not yet used anywhere for direct settlement.
 # Native USDC alternative: 0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359
 USDC_ADDRESS: str = os.getenv(
     "USDC_ADDRESS", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -170,33 +177,30 @@ class PolymarketAuth:
         The CTF Exchange verifies this on-chain; the signature must match
         the maker address embedded in the order struct.
         """
+        # CLOB V2 (docs.polymarket.com/v2-migration): domain version "1" ->
+        # "2", verifyingContract moved to the V2 exchange.
         domain = {
             "name": "Polymarket CTF Exchange",
-            "version": "1",
+            "version": "2",
             "chainId": CHAIN_ID,
             "verifyingContract": CLOB_EXCHANGE,
         }
+        # V2 Order struct drops taker/expiration/nonce/feeRateBps and adds
+        # timestamp/metadata/builder.
         types = {
             "Order": [
                 {"name": "salt", "type": "uint256"},
                 {"name": "maker", "type": "address"},
                 {"name": "signer", "type": "address"},
-                {"name": "taker", "type": "address"},
                 {"name": "tokenId", "type": "uint256"},
                 {"name": "makerAmount", "type": "uint256"},
                 {"name": "takerAmount", "type": "uint256"},
-                {"name": "expiration", "type": "uint256"},
-                {"name": "nonce", "type": "uint256"},
-                {"name": "feeRateBps", "type": "uint256"},
                 {"name": "side", "type": "uint8"},
                 {"name": "signatureType", "type": "uint8"},
+                {"name": "timestamp", "type": "uint256"},
+                {"name": "metadata", "type": "bytes32"},
+                {"name": "builder", "type": "bytes32"},
             ]
-        }
-        structured = {
-            "domain": domain,
-            "types": types,
-            "primaryType": "Order",
-            "message": order,
         }
         # LocalAccount has no sign_typed_data instance method on the pinned
         # eth-account==0.10.0 — it only exists as an Account classmethod
@@ -408,33 +412,59 @@ class PolymarketClient:
                 remaining_usdc=size_usdc,
             )
 
-        # Live order
+        # Live order — CLOB V2 (docs.polymarket.com/v2-migration).
         salt = random.randint(0, 2**256 - 1)
         expiration = int(time.time()) + expiry_seconds
         maker_amount = int(size_usdc * 1e6)          # USDC has 6 decimals
         taker_amount = int(size_usdc / price * 1e6)  # shares at this price
+        side_code = 0 if side == "BUY" else 1
+        timestamp_ms = int(time.time() * 1000)
+        zero_bytes32 = "0x" + "0" * 64  # no builder code configured
 
-        order_struct = {
+        # Exactly the 11 fields the V2 EIP-712 Order type defines — no
+        # taker/expiration/nonce/feeRateBps (removed in V2).
+        signed_order = {
             "salt": salt,
             "maker": self.auth.address,
             "signer": self.auth.address,
-            "taker": "0x0000000000000000000000000000000000000000",
             "tokenId": int(token_id),
             "makerAmount": maker_amount,
             "takerAmount": taker_amount,
-            "expiration": expiration,
-            "nonce": 0,
-            "feeRateBps": 0,
-            "side": 0 if side == "BUY" else 1,
+            "side": side_code,
             "signatureType": 0,  # EOA
+            "timestamp": timestamp_ms,
+            "metadata": zero_bytes32,
+            "builder": zero_bytes32,
         }
 
-        signature = self.auth.sign_order(order_struct)
+        signature = self.auth.sign_order(signed_order)
 
-        payload = {
-            "order": order_struct,
+        # Wire body: keeps expiration (GTD wire-level handling, not part of
+        # the signed struct), uses the string side, and stringifies large
+        # uint256-range fields for JSON transport.
+        wire_order = {
+            **signed_order,
+            "side": side,
+            "salt": str(salt),
+            "tokenId": str(int(token_id)),
+            "makerAmount": str(maker_amount),
+            "takerAmount": str(taker_amount),
+            "timestamp": str(timestamp_ms),
+            "expiration": str(expiration),
             "signature": signature,
-            "orderType": "LIMIT",
+        }
+
+        # GTD (Good-Til-Date), not GTC (Good-Til-Cancelled): this bot always
+        # sets a real, finite `expiration` as an exchange-side safety net in
+        # case bot-side cancel-replace can't fire (crash, restart, network
+        # partition). GTC conventionally ignores expiration entirely, which
+        # would silently disable that backstop in exactly the failure modes
+        # it exists for.
+        payload = {
+            "order": wire_order,
+            "owner": self.auth.api_key,
+            "orderType": "GTD",
+            "postOnly": False,
         }
 
         try:
