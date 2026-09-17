@@ -22,9 +22,11 @@ from approve_usdc import (
     _get_allowance,
     _is_already_approved,
     _send_approval,
+    _send_wrap,
     approve,
+    wrap_usdc_to_pusd,
 )
-from api_client import CLOB_EXCHANGE, USDC_ADDRESS
+from api_client import CLOB_EXCHANGE, COLLATERAL_ONRAMP_ADDRESS, PUSD_ADDRESS, USDC_ADDRESS
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -326,3 +328,152 @@ class TestApprove:
             result = approve(self.DUMMY_KEY, self.DUMMY_RPC, dry_run=True)
         assert result is None
         mock_w3.eth.send_raw_transaction.assert_not_called()
+
+    def test_can_approve_pusd_for_exchange(self):
+        """approve() is fully generic over (token, spender) — issue #9
+        reuses it to approve pUSD (not USDC.e) for the CTF Exchange V2,
+        since that's the allowance that actually matters for V2 settlement."""
+        factory, mock_w3, _ = self._make_factory(allowance=0)
+        with patch("approve_usdc._create_w3_and_account", side_effect=factory) as mock_create:
+            approve(self.DUMMY_KEY, self.DUMMY_RPC, usdc_address=PUSD_ADDRESS, spender=CLOB_EXCHANGE)
+        mock_create.assert_called_once_with(self.DUMMY_RPC, self.DUMMY_KEY, PUSD_ADDRESS, CLOB_EXCHANGE)
+
+    def test_can_approve_usdc_for_onramp(self):
+        """Reused for the other approval leg: USDC.e allowance to the
+        Collateral Onramp, required before wrap() can pull funds."""
+        factory, mock_w3, _ = self._make_factory(allowance=0)
+        with patch("approve_usdc._create_w3_and_account", side_effect=factory) as mock_create:
+            approve(self.DUMMY_KEY, self.DUMMY_RPC, usdc_address=USDC_ADDRESS, spender=COLLATERAL_ONRAMP_ADDRESS)
+        mock_create.assert_called_once_with(self.DUMMY_RPC, self.DUMMY_KEY, USDC_ADDRESS, COLLATERAL_ONRAMP_ADDRESS)
+
+
+# ─── _send_wrap (issue #9: USDC.e -> pUSD via Collateral Onramp) ─────────────
+
+class TestSendWrap:
+
+    def test_calls_wrap_with_asset_to_amount_in_order(self):
+        account  = _mock_account()
+        w3       = _mock_w3()
+        contract = MagicMock()
+        contract.functions.wrap.return_value.build_transaction = MagicMock(return_value={"nonce": 42})
+
+        signed = MagicMock()
+        signed.rawTransaction = b"\x00" * 32
+        account.sign_transaction.return_value = signed
+
+        receipt = MagicMock()
+        receipt.status  = 1
+        receipt.gasUsed = 80_000
+        w3.eth.send_raw_transaction.return_value = b"\xbb" * 32
+        w3.eth.wait_for_transaction_receipt.return_value = receipt
+
+        _send_wrap(contract, account, USDC_ADDRESS, account.address, 300_000_000, w3)
+
+        contract.functions.wrap.assert_called_once_with(USDC_ADDRESS, account.address, 300_000_000)
+
+    def test_returns_hex_tx_hash(self):
+        account  = _mock_account()
+        w3       = _mock_w3()
+        contract = MagicMock()
+        contract.functions.wrap.return_value.build_transaction.return_value = {}
+
+        signed = MagicMock()
+        signed.rawTransaction = b"\x00" * 32
+        account.sign_transaction.return_value = signed
+
+        raw_hash = bytes(range(32))
+        receipt  = MagicMock()
+        receipt.status  = 1
+        receipt.gasUsed = 80_000
+        w3.eth.send_raw_transaction.return_value = raw_hash
+        w3.eth.wait_for_transaction_receipt.return_value = receipt
+
+        result = _send_wrap(contract, account, USDC_ADDRESS, account.address, 300_000_000, w3)
+        assert result == raw_hash.hex()
+
+    def test_raises_on_reverted_receipt(self):
+        account  = _mock_account()
+        w3       = _mock_w3()
+        contract = MagicMock()
+        contract.functions.wrap.return_value.build_transaction.return_value = {}
+
+        signed = MagicMock()
+        signed.rawTransaction = b"\x00" * 32
+        account.sign_transaction.return_value = signed
+
+        receipt = MagicMock()
+        receipt.status  = 0
+        receipt.gasUsed = 21_000
+        w3.eth.send_raw_transaction.return_value = b"\xcc" * 32
+        w3.eth.wait_for_transaction_receipt.return_value = receipt
+
+        with pytest.raises(RuntimeError, match="reverted"):
+            _send_wrap(contract, account, USDC_ADDRESS, account.address, 300_000_000, w3)
+
+
+# ─── wrap_usdc_to_pusd() top-level ────────────────────────────────────────────
+
+class TestWrapUsdcToPusd:
+    """
+    Moves real funds (USDC.e -> pUSD) — never automatic, always requires an
+    explicit amount from the caller. Mirrors TestApprove's patching pattern.
+    """
+
+    DUMMY_KEY = "0x" + "a" * 64
+    DUMMY_RPC = "https://polygon-rpc.com"
+
+    def _make_factory(self, connected: bool = True):
+        mock_w3 = _mock_w3()
+        mock_w3.is_connected.return_value = connected
+
+        mock_contract = MagicMock()
+        mock_contract.functions.wrap.return_value.build_transaction = MagicMock(return_value={})
+
+        signed = MagicMock()
+        signed.rawTransaction = b"\xee" * 32
+        mock_account = _mock_account()
+        mock_account.sign_transaction.return_value = signed
+
+        raw_hash = b"\xff" * 32
+        receipt  = MagicMock()
+        receipt.status  = 1
+        receipt.gasUsed = 80_000
+        mock_w3.eth.send_raw_transaction.return_value = raw_hash
+        mock_w3.eth.wait_for_transaction_receipt.return_value = receipt
+
+        def factory(rpc_url, private_key, onramp_address, abi):
+            return mock_w3, mock_account, mock_contract
+
+        return factory, mock_w3, mock_account, mock_contract
+
+    def test_raises_connection_error_when_rpc_unreachable(self):
+        factory, mock_w3, _, _ = self._make_factory(connected=False)
+        with patch("approve_usdc._create_w3_account_and_contract", side_effect=factory):
+            with pytest.raises(ConnectionError):
+                wrap_usdc_to_pusd(self.DUMMY_KEY, self.DUMMY_RPC, 300.0)
+
+    def test_scales_amount_by_1e6(self):
+        factory, mock_w3, account, contract = self._make_factory()
+        with patch("approve_usdc._create_w3_account_and_contract", side_effect=factory):
+            wrap_usdc_to_pusd(self.DUMMY_KEY, self.DUMMY_RPC, 300.0)
+        contract.functions.wrap.assert_called_once_with(USDC_ADDRESS, account.address, 300_000_000)
+
+    def test_dry_run_never_sends_tx(self):
+        factory, mock_w3, _, _ = self._make_factory()
+        with patch("approve_usdc._create_w3_account_and_contract", side_effect=factory):
+            result = wrap_usdc_to_pusd(self.DUMMY_KEY, self.DUMMY_RPC, 300.0, dry_run=True)
+        assert result is None
+        mock_w3.eth.send_raw_transaction.assert_not_called()
+
+    def test_returns_tx_hash_on_success(self):
+        factory, mock_w3, _, _ = self._make_factory()
+        with patch("approve_usdc._create_w3_account_and_contract", side_effect=factory):
+            result = wrap_usdc_to_pusd(self.DUMMY_KEY, self.DUMMY_RPC, 300.0)
+        assert result is not None
+        mock_w3.eth.send_raw_transaction.assert_called_once()
+
+    def test_rejects_non_positive_amount(self):
+        with pytest.raises(ValueError):
+            wrap_usdc_to_pusd(self.DUMMY_KEY, self.DUMMY_RPC, 0.0)
+        with pytest.raises(ValueError):
+            wrap_usdc_to_pusd(self.DUMMY_KEY, self.DUMMY_RPC, -5.0)

@@ -136,7 +136,11 @@ class HyperBTCBot:
         self.cfg = config
 
         auth = PolymarketAuth(
-            private_key=config.private_key or "0x" + "0" * 64,  # placeholder in sim
+            # Placeholder wallet for simulation mode when no real key is
+            # configured. Must be a *valid* non-zero secp256k1 scalar — an
+            # all-zero key is rejected by eth_keys (private key value must
+            # be >= 1) and would prevent the bot from starting at all.
+            private_key=config.private_key or "0x" + "0" * 63 + "1",
             api_key=config.api_key,
             api_secret=config.api_secret,
             api_passphrase=config.api_passphrase,
@@ -420,28 +424,122 @@ class HyperBTCBot:
                 del self._open_orders[order_id]
                 continue
 
-            # Check age via order_id timestamp (SIM prefix strips cleanly)
-            try:
-                placed_ts = int(order_id.split("-")[1]) if order_id.startswith("SIM-") else 0
-            except Exception:
-                placed_ts = 0
-
-            age = time.time() - placed_ts if placed_ts else self.cfg.order_timeout_seconds + 1
-
-            if age > self.cfg.order_timeout_seconds:
-                logger.info(
-                    "Order %s stale after %.0fs – cancel and replace.", order_id, age
+            # Age is derived from the order's persisted placement time so it
+            # works uniformly for SIM and live order IDs (order IDs from the
+            # live CLOB carry no timestamp we can parse).
+            row = self.order_store.get_order(order_id)
+            if row is None:
+                # Defensive: if we've lost track of this order's DB row,
+                # don't treat it as stale — waiting is the safer failure
+                # mode for live money than cancelling prematurely.
+                logger.warning(
+                    "Order %s missing from store – skipping staleness check.",
+                    order_id,
                 )
-                self.client.cancel_order(order_id)
-                self.order_store.update_status(order_id, "cancelled")
-                del self._open_orders[order_id]
+                continue
 
-                # Replace at updated mid
-                refreshed = self._refresh_orderbook(market)
-                if self._signal_fired_this_window and refreshed:
-                    # Re-use the signal's token; update price
-                    # (We only replace once to avoid a loop)
-                    pass  # replacement handled next _tick via _signal_fired = True
+            age = time.time() - row["created_at"]
+            if age <= self.cfg.order_timeout_seconds:
+                continue
+
+            logger.info(
+                "Order %s stale after %.0fs – cancelling.", order_id, age
+            )
+            if not self.client.cancel_order(order_id):
+                # Exchange didn't confirm the cancel — the order may still
+                # be live. Leave it tracked as open rather than risk placing
+                # a duplicate; it will be re-checked next tick.
+                logger.warning(
+                    "Order %s: cancel not confirmed – leaving tracked as open.",
+                    order_id,
+                )
+                continue
+
+            self.order_store.update_status(order_id, "cancelled")
+            del self._open_orders[order_id]
+
+            time_left = seconds_until_close(market.end_time)
+            if time_left <= self.cfg.order_timeout_seconds:
+                logger.info(
+                    "Order %s: only %.0fs left in window – not replacing.",
+                    order_id, time_left,
+                )
+                continue
+
+            # Replace once at the refreshed mid for the same token/side, but
+            # only for whatever's still unfilled.
+            refreshed = self._refresh_orderbook(market)
+            token_id = row["token_id"]
+            if token_id == market.tokens.yes_token_id:
+                book_bid, book_ask, new_price = refreshed.yes_bid, refreshed.yes_ask, refreshed.yes_mid
+            elif token_id == market.tokens.no_token_id:
+                book_bid, book_ask, new_price = refreshed.no_bid, refreshed.no_ask, refreshed.no_mid
+            else:
+                logger.warning(
+                    "Order %s: token %s not in current market – not replacing.",
+                    order_id, token_id[:8],
+                )
+                continue
+
+            # _fetch_orderbook falls back to {bid: 0.0, ask: 1.0} on a fetch
+            # failure, which would make this mid compute to 1.0 — the worst
+            # possible price for a binary market. Treat that exact sentinel
+            # as "we don't actually know the price" and skip replacement.
+            if book_bid == 0.0 and book_ask == 1.0:
+                logger.warning(
+                    "Order %s: orderbook refresh failed or empty (bid=0.0, ask=1.0) "
+                    "– not replacing.",
+                    order_id,
+                )
+                continue
+
+            # SIM orders have no concept of partial fills (get_order_status's
+            # sim branch never reports a meaningful remaining_usdc), so they
+            # always replace at the full original size. A real order that
+            # partially filled before going stale must be replaced only for
+            # its unfilled remainder, not the full original size — otherwise
+            # the partial fill plus a full replacement can exceed the
+            # intended Kelly-sized exposure. A live order reporting zero
+            # remaining while still "live" is an anomalous exchange
+            # response; skip rather than guess a size.
+            if order_id.startswith("SIM-"):
+                replace_size = row["size_usdc"]
+            else:
+                replace_size = status.remaining_usdc
+                if replace_size <= 0:
+                    logger.warning(
+                        "Order %s: no remaining size reported (status=%s) – "
+                        "not replacing.",
+                        order_id, status.status,
+                    )
+                    continue
+
+            result = self.client.place_limit_order(
+                token_id=token_id,
+                side=row["side"],
+                price=new_price,
+                size_usdc=replace_size,
+                expiry_seconds=self.cfg.order_timeout_seconds * 2,
+            )
+
+            if result.status == "error":
+                logger.error(
+                    "Replacement order failed for %s: %s", order_id, result.error
+                )
+                continue
+
+            self._open_orders[result.order_id] = result
+            self.order_store.insert_order(
+                order_id=result.order_id,
+                token_id=token_id,
+                side=row["side"],
+                entry_price=new_price,
+                size_usdc=replace_size,
+                window_end=market.end_time,
+            )
+            logger.info(
+                "Order %s replaced by %s @ %.4f", order_id, result.order_id, new_price
+            )
 
     # ── Window close handler ──────────────────────────────────────────────────
 
