@@ -466,13 +466,14 @@ class HyperBTCBot:
                 )
                 continue
 
-            # Replace once at the refreshed mid for the same token/side/size.
+            # Replace once at the refreshed mid for the same token/side, but
+            # only for whatever's still unfilled.
             refreshed = self._refresh_orderbook(market)
             token_id = row["token_id"]
             if token_id == market.tokens.yes_token_id:
-                new_price = refreshed.yes_mid
+                book_bid, book_ask, new_price = refreshed.yes_bid, refreshed.yes_ask, refreshed.yes_mid
             elif token_id == market.tokens.no_token_id:
-                new_price = refreshed.no_mid
+                book_bid, book_ask, new_price = refreshed.no_bid, refreshed.no_ask, refreshed.no_mid
             else:
                 logger.warning(
                     "Order %s: token %s not in current market – not replacing.",
@@ -480,11 +481,44 @@ class HyperBTCBot:
                 )
                 continue
 
+            # _fetch_orderbook falls back to {bid: 0.0, ask: 1.0} on a fetch
+            # failure, which would make this mid compute to 1.0 — the worst
+            # possible price for a binary market. Treat that exact sentinel
+            # as "we don't actually know the price" and skip replacement.
+            if book_bid == 0.0 and book_ask == 1.0:
+                logger.warning(
+                    "Order %s: orderbook refresh failed or empty (bid=0.0, ask=1.0) "
+                    "– not replacing.",
+                    order_id,
+                )
+                continue
+
+            # SIM orders have no concept of partial fills (get_order_status's
+            # sim branch never reports a meaningful remaining_usdc), so they
+            # always replace at the full original size. A real order that
+            # partially filled before going stale must be replaced only for
+            # its unfilled remainder, not the full original size — otherwise
+            # the partial fill plus a full replacement can exceed the
+            # intended Kelly-sized exposure. A live order reporting zero
+            # remaining while still "live" is an anomalous exchange
+            # response; skip rather than guess a size.
+            if order_id.startswith("SIM-"):
+                replace_size = row["size_usdc"]
+            else:
+                replace_size = status.remaining_usdc
+                if replace_size <= 0:
+                    logger.warning(
+                        "Order %s: no remaining size reported (status=%s) – "
+                        "not replacing.",
+                        order_id, status.status,
+                    )
+                    continue
+
             result = self.client.place_limit_order(
                 token_id=token_id,
                 side=row["side"],
                 price=new_price,
-                size_usdc=row["size_usdc"],
+                size_usdc=replace_size,
                 expiry_seconds=self.cfg.order_timeout_seconds * 2,
             )
 
@@ -500,7 +534,7 @@ class HyperBTCBot:
                 token_id=token_id,
                 side=row["side"],
                 entry_price=new_price,
-                size_usdc=row["size_usdc"],
+                size_usdc=replace_size,
                 window_end=market.end_time,
             )
             logger.info(

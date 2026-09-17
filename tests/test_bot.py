@@ -66,9 +66,11 @@ def bot() -> HyperBTCBot:
     b.order_store.close()
     b.order_store = OrderStore(":memory:")
 
-    # Isolate _manage_open_orders from real network I/O.
+    # Isolate _manage_open_orders from real network I/O. remaining_usdc
+    # matches track_order's default size_usdc (25.0) so tests that don't
+    # care about partial fills see "nothing filled yet", not "fully filled".
     b.client.get_order_status = MagicMock(
-        return_value=OrderResult(order_id="unused", status="live")
+        return_value=OrderResult(order_id="unused", status="live", remaining_usdc=25.0)
     )
     b.client.cancel_order = MagicMock(return_value=True)
     b.client.place_limit_order = MagicMock(
@@ -210,3 +212,84 @@ class TestStalenessTiming:
         assert "0xLIVE_ORDER_ID" in bot._open_orders
         row = bot.order_store.get_order("0xLIVE_ORDER_ID")
         assert row["status"] == "open"
+
+    def test_no_replace_when_orderbook_refresh_failed(self, bot):
+        """PR #8 review finding: _fetch_orderbook silently falls back to
+        {bid: 0.0, ask: 1.0} on failure, which would make yes_mid/no_mid
+        compute to 1.0 — the worst possible price for a binary market.
+        Must detect that sentinel and skip replacement rather than
+        submitting a replacement order at price 1.0."""
+        import asyncio
+
+        market = make_market(end_time=int(time.time()) + 120)
+        # Orderbook fetch failed for both tokens -> the exact fallback shape.
+        failed_market = make_market(end_time=market.end_time)
+        failed_market.yes_bid = 0.0
+        failed_market.yes_ask = 1.0
+        bot._refresh_orderbook = MagicMock(return_value=failed_market)
+
+        track_order(bot, "0xLIVE_ORDER_ID", age_seconds=10)
+
+        asyncio.run(bot._manage_open_orders(market))
+
+        bot.client.cancel_order.assert_called_once_with("0xLIVE_ORDER_ID")
+        bot.client.place_limit_order.assert_not_called()
+        assert bot._open_orders == {}
+
+    def test_replacement_uses_remaining_size_not_original_size(self, bot):
+        """PR #8 review finding: a live order that partially filled before
+        going stale must be replaced only for its unfilled remainder, not
+        the full original size — otherwise the partial fill plus a
+        full-size replacement can exceed the intended Kelly-sized exposure."""
+        import asyncio
+
+        bot.client.get_order_status = MagicMock(
+            return_value=OrderResult(order_id="unused", status="live", remaining_usdc=10.0)
+        )
+
+        market = make_market(end_time=int(time.time()) + 120)
+        track_order(bot, "0xLIVE_ORDER_ID", age_seconds=10, size_usdc=25.0)
+
+        asyncio.run(bot._manage_open_orders(market))
+
+        bot.client.place_limit_order.assert_called_once()
+        _, kwargs = bot.client.place_limit_order.call_args
+        assert kwargs["size_usdc"] == pytest.approx(10.0)
+
+    def test_sim_order_replacement_still_uses_full_size(self, bot):
+        """Simulation mode has no concept of partial fills (get_order_status
+        for a SIM- order never reports a meaningful remaining_usdc), so a
+        SIM order must still replace at its full original size."""
+        import asyncio
+
+        bot.client.get_order_status = MagicMock(
+            return_value=OrderResult(order_id="unused", status="live", remaining_usdc=0.0)
+        )
+
+        market = make_market(end_time=int(time.time()) + 120)
+        track_order(bot, "SIM-1000-0001", age_seconds=10, size_usdc=25.0)
+
+        asyncio.run(bot._manage_open_orders(market))
+
+        bot.client.place_limit_order.assert_called_once()
+        _, kwargs = bot.client.place_limit_order.call_args
+        assert kwargs["size_usdc"] == pytest.approx(25.0)
+
+    def test_no_replace_when_live_order_reports_zero_remaining(self, bot):
+        """A non-SIM order reporting status="live" with remaining_usdc<=0
+        is an anomalous/ambiguous exchange response — safer to skip
+        replacement than guess a size."""
+        import asyncio
+
+        bot.client.get_order_status = MagicMock(
+            return_value=OrderResult(order_id="unused", status="live", remaining_usdc=0.0)
+        )
+
+        market = make_market(end_time=int(time.time()) + 120)
+        track_order(bot, "0xLIVE_ORDER_ID", age_seconds=10)
+
+        asyncio.run(bot._manage_open_orders(market))
+
+        bot.client.cancel_order.assert_called_once_with("0xLIVE_ORDER_ID")
+        bot.client.place_limit_order.assert_not_called()
+        assert bot._open_orders == {}
