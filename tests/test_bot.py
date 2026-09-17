@@ -44,6 +44,36 @@ class TestBotConstruction:
             if os.path.exists("orders.db"):
                 os.remove("orders.db")
 
+    def test_env_example_private_key_is_empty(self):
+        """Regression test: `cp .env.example .env && python bot.py` must work
+        with zero edits, exactly as the module docstring promises. Caught a
+        real bug: .env.example used to ship
+        PRIVATE_KEY=your_polygon_private_key_here (non-empty placeholder
+        text), so BotConfig.from_env()'s `or` fallback to the safe dummy key
+        never triggered — the literal placeholder text got parsed as hex and
+        crashed construction. PRIVATE_KEY must be empty in .env.example, not
+        placeholder text, for the documented default to actually work.
+
+        Checked directly against the file's content rather than through
+        BotConfig.from_env()/load_dotenv(): python-dotenv's default
+        find_dotenv() resolves its search path from the caller's stack
+        frame, not the process's CWD, so monkeypatch.chdir() doesn't
+        reliably control it in a pytest context — a load-based test here
+        would pass or fail for the wrong reason.
+        """
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env_example_path = os.path.join(repo_root, ".env.example")
+
+        for line in open(env_example_path):
+            if line.startswith("PRIVATE_KEY="):
+                value = line.rstrip("\n").split("=", 1)[1]
+                assert value == "", (
+                    f"PRIVATE_KEY in .env.example must be empty for the "
+                    f"safe-default fallback to trigger, got {value!r}"
+                )
+                return
+        pytest.fail("PRIVATE_KEY line not found in .env.example")
+
 
 def make_market(end_time: int = WINDOW_END) -> MarketInfo:
     return MarketInfo(
