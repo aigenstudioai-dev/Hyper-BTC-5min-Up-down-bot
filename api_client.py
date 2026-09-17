@@ -54,6 +54,19 @@ USDC_ADDRESS: str = os.getenv(
     "USDC_ADDRESS", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 )
 
+# pUSD (Polymarket USD) — the actual CLOB V2 settlement/collateral token.
+# Standard ERC-20, 1:1 backed by USDC.e. Confirmed via Polymarket's own
+# ctf-exchange-v2 GitHub repo ("Deployed Contracts"); see issue #9.
+PUSD_ADDRESS: str = os.getenv(
+    "PUSD_ADDRESS", "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+)
+
+# Collateral Onramp — wraps USDC.e into pUSD via wrap(asset, to, amount).
+# Same source as PUSD_ADDRESS above.
+COLLATERAL_ONRAMP_ADDRESS: str = os.getenv(
+    "COLLATERAL_ONRAMP_ADDRESS", "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+)
+
 # Pyth BTC/USD feed ID (verified via https://pyth.network/price-feeds)
 BTC_USD_FEED_ID: str = (
     "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"

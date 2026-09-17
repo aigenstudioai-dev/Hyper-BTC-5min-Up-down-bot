@@ -202,37 +202,47 @@ def step_health_check(skip_ws: bool = False) -> bool:
 
 def step_usdc_allowance(values: dict) -> bool:
     """
-    Check USDC allowance using approve_usdc dry-run logic.
-    Skips gracefully if web3 is not installed.
+    Check collateral readiness for CLOB V2: pUSD allowance to the CTF
+    Exchange (the allowance that actually matters for order settlement —
+    see issue #9) plus a pUSD balance sanity check. Skips gracefully if
+    web3 is not installed.
     """
     pk      = values.get("PRIVATE_KEY", "")
     rpc_url = values.get("POLYGON_RPC_URL", "")
 
     if not pk or not rpc_url:
-        _fail("USDC allowance", "PRIVATE_KEY or POLYGON_RPC_URL missing — skipped")
+        _fail("pUSD allowance", "PRIVATE_KEY or POLYGON_RPC_URL missing — skipped")
         return False
 
     try:
         from approve_usdc import ALREADY_APPROVED_THRESHOLD, _create_w3_and_account, _get_allowance
-        from api_client import CLOB_EXCHANGE, USDC_ADDRESS
+        from api_client import CLOB_EXCHANGE, PUSD_ADDRESS
 
-        w3, account, usdc, spender = _create_w3_and_account(
-            rpc_url, pk, USDC_ADDRESS, CLOB_EXCHANGE
+        w3, account, pusd, spender = _create_w3_and_account(
+            rpc_url, pk, PUSD_ADDRESS, CLOB_EXCHANGE
         )
         if not w3.is_connected():
-            _fail("USDC allowance", f"cannot connect to {rpc_url}")
+            _fail("pUSD allowance", f"cannot connect to {rpc_url}")
             return False
 
-        allowance = _get_allowance(usdc, account.address, spender)
-        if allowance >= ALREADY_APPROVED_THRESHOLD:
-            _ok("USDC allowance", f"approved (allowance ≥ 2^128)")
-            return True
+        allowance = _get_allowance(pusd, account.address, spender)
+        if allowance < ALREADY_APPROVED_THRESHOLD:
+            _fail(
+                "pUSD allowance",
+                f"only {allowance} — run: python approve_usdc.py",
+            )
+            return False
+        _ok("pUSD allowance", "approved (allowance ≥ 2^128)")
 
-        _fail(
-            "USDC allowance",
-            f"only {allowance} — run: python approve_usdc.py",
-        )
-        return False
+        balance = pusd.functions.balanceOf(account.address).call()
+        if balance <= 0:
+            _fail(
+                "pUSD balance",
+                "zero — wrap USDC.e first: python approve_usdc.py --wrap AMOUNT",
+            )
+            return False
+        _ok("pUSD balance", f"{balance / 1e6:.2f} pUSD")
+        return True
 
     except ImportError:
         _info("web3 not installed in this environment — skipping allowance check")

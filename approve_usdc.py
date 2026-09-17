@@ -1,16 +1,27 @@
 """
-approve_usdc.py – One-time USDC approval for the Polymarket CTF Exchange.
+approve_usdc.py – Collateral setup for the Polymarket CTF Exchange (CLOB V2).
 
-The Polymarket CLOB exchange pulls USDC from your wallet via the standard
-ERC-20 allowance mechanism.  Run this script once before going live; the
-bot will then be able to place orders without further manual steps.
+CLOB V2 settles trades in pUSD, not USDC.e directly (see issue #7/#9).
+Getting a wallet ready to trade is three steps:
 
-If the allowance is already >= 2^128 the script exits immediately without
-broadcasting any transaction.
+  1. Approve the Collateral Onramp to pull USDC.e (needed before wrapping).
+  2. Wrap USDC.e into pUSD via the Onramp's wrap() function — moves real
+     funds, so this only happens when you explicitly pass --wrap AMOUNT.
+  3. Approve the CTF Exchange to pull pUSD (the allowance that actually
+     matters for V2 order settlement).
+
+Running with no flags handles the two *approval* legs only (steps 1 and 3)
+— ordinary, reversible ERC-20 approvals. Nothing ever gets wrapped without
+an explicit --wrap AMOUNT.
+
+If an allowance is already >= 2^128 that leg is skipped without
+broadcasting a transaction.
 
 Usage:
-    python approve_usdc.py               # send the approval on-chain
-    python approve_usdc.py --dry-run     # check allowance, build tx, but do NOT send
+    python approve_usdc.py                    # approve both legs
+    python approve_usdc.py --dry-run          # check allowances, build txs, send nothing
+    python approve_usdc.py --wrap 300         # also wrap 300 USDC.e into pUSD
+    python approve_usdc.py --wrap 300 --dry-run
 
 Required env vars (.env):
     PRIVATE_KEY       – 0x-prefixed hex private key of your Polygon wallet
@@ -18,9 +29,10 @@ Required env vars (.env):
                         or a private Alchemy/Infura endpoint)
 
 Optional env vars:
-    USDC_ADDRESS      – Override the USDC contract address.
+    USDC_ADDRESS      – Override the USDC.e contract address.
                         Default: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
-                        (USDC.e – Bridged USDC on Polygon, the one Polymarket uses)
+    PUSD_ADDRESS      – Override the pUSD contract address.
+    COLLATERAL_ONRAMP_ADDRESS – Override the Collateral Onramp address.
 """
 
 from __future__ import annotations
@@ -31,7 +43,13 @@ import os
 import sys
 from typing import Optional
 
-from api_client import CHAIN_ID, CLOB_EXCHANGE, USDC_ADDRESS
+from api_client import (
+    CHAIN_ID,
+    CLOB_EXCHANGE,
+    COLLATERAL_ONRAMP_ADDRESS,
+    PUSD_ADDRESS,
+    USDC_ADDRESS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +62,7 @@ MAX_UINT256: int = 2 ** 256 - 1
 # drops below a practically inexhaustible amount.
 ALREADY_APPROVED_THRESHOLD: int = 2 ** 128
 
-# Minimal ERC-20 ABI (allowance + approve only)
+# Minimal ERC-20 ABI (allowance + approve + balanceOf)
 _ERC20_ABI = [
     {
         "inputs": [
@@ -63,6 +81,30 @@ _ERC20_ABI = [
         ],
         "name": "approve",
         "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+# Collateral Onramp ABI (wrap() only). Signature confirmed via Polymarket's
+# own py-sdk GitHub repo (issue #261: "wrap(address,address,uint256)"),
+# corroborated by an independently-generated ABI binding — see issue #9.
+_ONRAMP_ABI = [
+    {
+        "inputs": [
+            {"name": "asset",  "type": "address"},
+            {"name": "to",     "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "name": "wrap",
+        "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function",
     },
@@ -114,6 +156,39 @@ def _send_approval(contract, account, spender: str, w3) -> str:
     return tx_hash.hex()
 
 
+def _send_wrap(onramp_contract, account, asset: str, to: str, amount: int, w3) -> str:
+    """
+    Build, sign, and broadcast a wrap(asset, to, amount) transaction on the
+    Collateral Onramp — moves real USDC.e into pUSD.
+    Returns the hex transaction hash.
+    Raises RuntimeError if the on-chain receipt reports failure.
+    """
+    nonce = w3.eth.get_transaction_count(account.address)
+    tx = onramp_contract.functions.wrap(asset, to, amount).build_transaction(
+        {
+            "from":     account.address,
+            "nonce":    nonce,
+            "gas":      200_000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId":  CHAIN_ID,
+        }
+    )
+    signed  = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+    if receipt.status != 1:
+        raise RuntimeError(
+            f"Wrap transaction reverted: {tx_hash.hex()}"
+        )
+
+    logger.info(
+        "Wrapped!  tx=%s  gas_used=%d",
+        tx_hash.hex(), receipt.gasUsed,
+    )
+    return tx_hash.hex()
+
+
 # ─── Main entry point ─────────────────────────────────────────────────────────
 
 
@@ -138,6 +213,27 @@ def _create_w3_and_account(rpc_url: str, private_key: str, usdc_address: str, sp
     return w3, account, usdc, spender
 
 
+def _create_w3_account_and_contract(rpc_url: str, private_key: str, address: str, abi: list):
+    """
+    Like ``_create_w3_and_account`` but for an arbitrary (address, ABI) pair
+    rather than the hardcoded ERC-20 ABI — used for the Collateral Onramp.
+
+    Isolated so tests can patch ``approve_usdc._create_w3_account_and_contract``
+    without needing web3 installed.
+
+    Returns:
+        (w3, account, contract)
+    """
+    from web3 import Web3
+    from eth_account import Account
+
+    w3       = Web3(Web3.HTTPProvider(rpc_url))
+    account  = Account.from_key(private_key)
+    checksum = Web3.to_checksum_address(address)
+    contract = w3.eth.contract(address=checksum, abi=abi)
+    return w3, account, contract
+
+
 def approve(
     private_key: str,
     rpc_url: str,
@@ -147,12 +243,19 @@ def approve(
     dry_run: bool = False,
 ) -> Optional[str]:
     """
-    Ensure the CLOB Exchange has max USDC allowance from the given wallet.
+    Ensure ``spender`` has max allowance to spend ``usdc_address`` from the
+    given wallet. Despite the parameter names (kept for backwards
+    compatibility), this works for any ERC-20 token — issue #9 reuses it
+    for both collateral-setup legs under CLOB V2:
+      - usdc_address=USDC_ADDRESS, spender=COLLATERAL_ONRAMP_ADDRESS
+        (needed before wrap_usdc_to_pusd can pull funds)
+      - usdc_address=PUSD_ADDRESS, spender=CLOB_EXCHANGE
+        (the allowance that actually matters for V2 order settlement)
 
     Args:
         private_key:   Hex private key (with or without 0x prefix).
         rpc_url:       Polygon mainnet JSON-RPC URL.
-        usdc_address:  USDC contract address on Polygon.
+        usdc_address:  ERC-20 token contract address on Polygon.
         spender:       Contract to approve (default: Polymarket CLOB Exchange).
         dry_run:       If True, log what would happen but send no transaction.
 
@@ -201,6 +304,67 @@ def _check_and_approve(usdc_contract, account, spender: str, w3, *, dry_run: boo
     return _send_approval(usdc_contract, account, spender, w3)
 
 
+def wrap_usdc_to_pusd(
+    private_key: str,
+    rpc_url: str,
+    amount_usdc: float,
+    *,
+    usdc_address: str = USDC_ADDRESS,
+    onramp_address: str = COLLATERAL_ONRAMP_ADDRESS,
+    dry_run: bool = False,
+) -> Optional[str]:
+    """
+    Wrap ``amount_usdc`` of USDC.e into pUSD via the Collateral Onramp's
+    wrap(asset, to, amount) function (issue #9).
+
+    This moves real funds and is never automatic elsewhere in this
+    codebase — it only runs when the caller passes an explicit,
+    positive amount.
+
+    Args:
+        private_key:    Hex private key (with or without 0x prefix).
+        rpc_url:        Polygon mainnet JSON-RPC URL.
+        amount_usdc:    Human-readable USDC.e amount to wrap (e.g. 300.0).
+                         Must be > 0. Scaled by 1e6 (6 decimals, same as
+                         USDC.e/pUSD).
+        usdc_address:   USDC.e contract address.
+        onramp_address: Collateral Onramp contract address.
+        dry_run:        If True, log what would happen but send no transaction.
+
+    Returns:
+        Hex transaction hash if a wrap was broadcast, None if dry_run.
+
+    Raises:
+        ValueError:      If amount_usdc is not positive.
+        ConnectionError: If the RPC endpoint is unreachable.
+        RuntimeError:    If the wrap transaction reverts on-chain.
+    """
+    if amount_usdc <= 0:
+        raise ValueError(f"amount_usdc must be positive, got {amount_usdc}")
+
+    w3, account, onramp = _create_w3_account_and_contract(
+        rpc_url, private_key, onramp_address, _ONRAMP_ABI
+    )
+    if not w3.is_connected():
+        raise ConnectionError(f"Cannot connect to Polygon RPC: {rpc_url}")
+
+    amount = int(amount_usdc * 1e6)
+
+    if dry_run:
+        logger.info(
+            "[DRY RUN] Would wrap %.2f USDC.e (%d units) into pUSD via %s. "
+            "No transaction sent.",
+            amount_usdc, amount, onramp_address,
+        )
+        return None
+
+    logger.info(
+        "Sending wrap(asset=%s, to=%s, amount=%d)…",
+        usdc_address, account.address, amount,
+    )
+    return _send_wrap(onramp, account, usdc_address, account.address, amount, w3)
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -214,12 +378,20 @@ def main() -> None:
     )
 
     p = argparse.ArgumentParser(
-        description="Approve the Polymarket CLOB Exchange to spend USDC from your wallet."
+        description="Set up collateral for the Polymarket CLOB Exchange (CLOB V2 / pUSD)."
     )
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Check allowance and build the tx without broadcasting it.",
+        help="Check allowances/balances and build txs without broadcasting anything.",
+    )
+    p.add_argument(
+        "--wrap",
+        type=float,
+        default=None,
+        metavar="AMOUNT",
+        help="Also wrap AMOUNT USDC.e into pUSD via the Collateral Onramp. "
+             "Moves real funds — only runs when you pass this explicitly.",
     )
     args = p.parse_args()
 
@@ -228,6 +400,8 @@ def main() -> None:
     private_key = os.getenv("PRIVATE_KEY", "")
     rpc_url     = os.getenv("POLYGON_RPC_URL", "")
     usdc_addr   = os.getenv("USDC_ADDRESS", USDC_ADDRESS)
+    pusd_addr   = os.getenv("PUSD_ADDRESS", PUSD_ADDRESS)
+    onramp_addr = os.getenv("COLLATERAL_ONRAMP_ADDRESS", COLLATERAL_ONRAMP_ADDRESS)
 
     if not private_key:
         logger.error("PRIVATE_KEY is not set in .env")
@@ -237,21 +411,52 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        tx_hash = approve(
+        # Leg 1: approve the Onramp to pull USDC.e (needed before wrapping).
+        onramp_tx = approve(
             private_key=private_key,
             rpc_url=rpc_url,
             usdc_address=usdc_addr,
+            spender=onramp_addr,
             dry_run=args.dry_run,
         )
-    except (ConnectionError, RuntimeError) as exc:
+        if onramp_tx:
+            print(f"\nApproved Collateral Onramp for USDC.e: {onramp_tx}")
+        elif not args.dry_run:
+            print("\nCollateral Onramp USDC.e allowance already sufficient.")
+
+        # Leg 2 (optional): wrap USDC.e into pUSD.
+        if args.wrap is not None:
+            wrap_tx = wrap_usdc_to_pusd(
+                private_key=private_key,
+                rpc_url=rpc_url,
+                amount_usdc=args.wrap,
+                usdc_address=usdc_addr,
+                onramp_address=onramp_addr,
+                dry_run=args.dry_run,
+            )
+            if wrap_tx:
+                print(f"Wrapped {args.wrap} USDC.e into pUSD: {wrap_tx}")
+
+        # Leg 3: approve the Exchange to pull pUSD — the allowance that
+        # actually matters for V2 order settlement.
+        exchange_tx = approve(
+            private_key=private_key,
+            rpc_url=rpc_url,
+            usdc_address=pusd_addr,
+            spender=CLOB_EXCHANGE,
+            dry_run=args.dry_run,
+        )
+        if exchange_tx:
+            print(f"Approved CTF Exchange for pUSD: {exchange_tx}")
+        elif not args.dry_run:
+            print("CTF Exchange pUSD allowance already sufficient.")
+
+    except (ConnectionError, RuntimeError, ValueError) as exc:
         logger.error("%s", exc)
         sys.exit(1)
 
-    if tx_hash:
-        print(f"\nApproval sent: {tx_hash}")
-        print("You can now run the bot with: python bot.py\n")
-    elif not args.dry_run:
-        print("\nAllowance already sufficient – nothing to do.\n")
+    if not args.dry_run:
+        print("\nYou can now run the bot with: python bot.py\n")
 
 
 if __name__ == "__main__":

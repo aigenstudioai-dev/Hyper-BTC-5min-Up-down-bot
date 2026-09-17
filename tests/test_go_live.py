@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -20,6 +21,7 @@ from go_live import (
     is_valid_private_key,
     load_env_values,
     patch_simulation_mode,
+    step_usdc_allowance,
 )
 
 
@@ -231,3 +233,49 @@ class TestPatchSimulationMode:
         # which means the file will have SIMULATION_MODE=false appearing once still
         text = f.read_text()
         assert "SIMULATION_MODE=false" in text
+
+
+# ─── step_usdc_allowance (issue #9: checks pUSD, not USDC.e, under V2) ───────
+
+class TestStepUsdcAllowance:
+
+    VALUES = {"PRIVATE_KEY": "0x" + "1" * 64, "POLYGON_RPC_URL": "https://polygon-rpc.com"}
+
+    def _make_factory(self, allowance: int, balance: int, connected: bool = True):
+        mock_w3 = MagicMock()
+        mock_w3.is_connected.return_value = connected
+
+        mock_account = MagicMock()
+        mock_account.address = "0xABcDef1234567890AbcdEF1234567890aBCDEF12"
+
+        mock_contract = MagicMock()
+        mock_contract.functions.allowance.return_value.call.return_value = allowance
+        mock_contract.functions.balanceOf.return_value.call.return_value = balance
+
+        def factory(rpc_url, private_key, token_address, spender):
+            return mock_w3, mock_account, mock_contract, spender
+
+        return factory
+
+    def test_fails_when_pusd_allowance_insufficient(self):
+        factory = self._make_factory(allowance=0, balance=0)
+        with patch("approve_usdc._create_w3_and_account", side_effect=factory):
+            assert step_usdc_allowance(self.VALUES) is False
+
+    def test_fails_when_pusd_balance_zero_despite_allowance(self):
+        factory = self._make_factory(allowance=2**200, balance=0)
+        with patch("approve_usdc._create_w3_and_account", side_effect=factory):
+            assert step_usdc_allowance(self.VALUES) is False
+
+    def test_passes_when_allowance_and_balance_both_sufficient(self):
+        factory = self._make_factory(allowance=2**200, balance=300_000_000)
+        with patch("approve_usdc._create_w3_and_account", side_effect=factory):
+            assert step_usdc_allowance(self.VALUES) is True
+
+    def test_fails_when_rpc_unreachable(self):
+        factory = self._make_factory(allowance=0, balance=0, connected=False)
+        with patch("approve_usdc._create_w3_and_account", side_effect=factory):
+            assert step_usdc_allowance(self.VALUES) is False
+
+    def test_fails_when_credentials_missing(self):
+        assert step_usdc_allowance({}) is False
